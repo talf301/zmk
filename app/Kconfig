@@ -114,6 +114,7 @@ menuconfig ZMK_SPLIT_BLE_ROLE_CENTRAL
 	bool "Central"
 	select BT_CENTRAL
 	select BT_GATT_CLIENT
+	select BT_GATT_AUTO_DISCOVER_CCC
 
 if ZMK_SPLIT_BLE_ROLE_CENTRAL
 
@@ -363,10 +364,10 @@ config ZMK_USB_LOGGING
 	select UART_CONSOLE
 	select USB_UART_CONSOLE
 
-if ZMK_USB_LOGGING
-
 config ZMK_LOG_LEVEL
 	default 4
+
+if ZMK_USB_LOGGING
 
 config USB_CDC_ACM_RINGBUF_SIZE
 	default 1024
