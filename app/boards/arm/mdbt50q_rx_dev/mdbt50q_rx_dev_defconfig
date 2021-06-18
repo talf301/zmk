@@ -23,3 +23,29 @@ CONFIG_SETTINGS_NVS=y
 CONFIG_FLASH=y
 CONFIG_FLASH_PAGE_LAYOUT=y
 CONFIG_FLASH_MAP=y
+
+################################################################################
+
+CONFIG_DEBUG=y
+CONFIG_LOG=y
+CONFIG_LOG_BACKEND_SHOW_COLOR=n
+
+# Use SEGGER J-Link for debugging.
+CONFIG_USE_SEGGER_RTT=y
+CONFIG_CONSOLE=y
+CONFIG_RTT_CONSOLE=y
+CONFIG_SEGGER_RTT_BUFFER_SIZE_UP=8192
+
+# Omit the boot banner as that causes the RTT log to be recognized as a file
+# with LF ending whereas all of the log messages end with CRLF. TODO TODO TODO
+CONFIG_BOOT_BANNER=n
+
+# TODO TODO TODO
+CONFIG_LOG_STRDUP_BUF_COUNT=16
+CONFIG_LOG_BUFFER_SIZE=8192
+
+# TODO TODO TODO figure out best value. under 1000?
+CONFIG_LOG_PROCESS_THREAD_SLEEP_MS=100
+
+# TODO TODO TODO
+CONFIG_ZMK_SPLIT_BLE_CENTRAL_PERIPHERALS=2
