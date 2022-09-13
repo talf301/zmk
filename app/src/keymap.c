@@ -80,6 +80,8 @@ static struct zmk_behavior_binding zmk_sensor_keymap[ZMK_KEYMAP_LAYERS_LEN]
 
 #endif /* ZMK_KEYMAP_HAS_SENSORS */
 
+void zmk_slicemk_set_layer(int layer);
+
 static inline int set_layer_state(uint8_t layer, bool state) {
     if (layer >= ZMK_KEYMAP_LAYERS_LEN) {
         return -EINVAL;
@@ -95,6 +97,7 @@ static inline int set_layer_state(uint8_t layer, bool state) {
     // Don't send state changes unless there was an actual change
     if (old_state != _zmk_keymap_layer_state) {
         LOG_DBG("layer_changed: layer %d state %d", layer, state);
+		zmk_slicemk_set_layer(zmk_keymap_highest_layer_active());
         ZMK_EVENT_RAISE(create_layer_state_changed(layer, state));
     }
 

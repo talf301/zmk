@@ -17,6 +17,12 @@
 
 #define COLLECTION_REPORT 0x03
 
+#define LSB(n) (n & 255)
+#define MSB(n) ((n >> 8) & 255)
+#define RAWHID_USAGE_PAGE 0xFFAB // recommended: 0xFF00 to 0xFFFF
+#define RAWHID_USAGE 0x0200 // recommended: 0x0100 to 0xFFFF
+#define RAWHID_TX_SIZE CONFIG_HID_INTERRUPT_EP_MPS-1
+
 static const uint8_t zmk_hid_report_desc[] = {
     HID_USAGE_PAGE(HID_USAGE_GEN_DESKTOP),
     HID_USAGE(HID_USAGE_GD_KEYBOARD),
@@ -89,6 +95,20 @@ static const uint8_t zmk_hid_report_desc[] = {
     /* INPUT (Data,Ary,Abs) */
     HID_INPUT(0x00),
     HID_END_COLLECTION,
+
+	// Define descriptor for Raw HID. Make sure the report ID is high enough to
+	// not overlap with the mouse keys stuff.
+	0x06, LSB(RAWHID_USAGE_PAGE), MSB(RAWHID_USAGE_PAGE),
+	0x0A, LSB(RAWHID_USAGE), MSB(RAWHID_USAGE),
+	HID_COLLECTION(HID_COLLECTION_APPLICATION),
+	HID_REPORT_ID(0x0A),
+	HID_USAGE(0x01),
+	HID_LOGICAL_MIN8(0x00),
+	HID_LOGICAL_MAX16(0xFF, 0x00),
+	HID_REPORT_COUNT(RAWHID_TX_SIZE),
+	HID_REPORT_SIZE(0x08),
+	HID_INPUT(0x02),
+	HID_END_COLLECTION,
 };
 
 // struct zmk_hid_boot_report

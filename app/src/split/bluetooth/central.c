@@ -51,10 +51,14 @@ static struct bt_gatt_discover_params ccc_params[CONFIG_ZMK_SPLIT_BLE_CENTRAL_PE
 K_MSGQ_DEFINE(peripheral_event_msgq, sizeof(struct zmk_position_state_changed),
               CONFIG_ZMK_SPLIT_BLE_CENTRAL_POSITION_QUEUE_SIZE, 4);
 
+
+void zmk_slicemk_set_key_state(int key, bool pressed);
+
 void peripheral_event_work_callback(struct k_work *work) {
     struct zmk_position_state_changed ev;
     while (k_msgq_get(&peripheral_event_msgq, &ev, K_NO_WAIT) == 0) {
         LOG_DBG("Trigger key position state change for %d", ev.position);
+        zmk_slicemk_set_key_state(ev.position, ev.state);
         ZMK_EVENT_RAISE(new_zmk_position_state_changed(ev));
     }
 }
