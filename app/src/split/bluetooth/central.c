@@ -15,43 +15,38 @@
 
 #include <logging/log.h>
 
-LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
+// Register custom logging module. This doesn't share with ZMK so this file is
+// easy to debug without being inundated with log messages from the rest of ZMK.
+LOG_MODULE_REGISTER(slicemk, 4);
 
-#include <zmk/stdlib.h>
 #include <zmk/ble.h>
 #include <zmk/behavior.h>
 #include <zmk/split/bluetooth/uuid.h>
-#include <zmk/split/bluetooth/service.h>
 #include <zmk/event_manager.h>
 #include <zmk/events/position_state_changed.h>
 #include <init.h>
 
 static int start_scan(void);
 
+// Define array for state of peripheral keys. Each array value is initialized to
+// 255 inside zmk_split_bt_central_init() as no key is pressed initially. The
+// array value corresponds to the peripheral_conns index for pressed keys.
 #define POSITION_STATE_DATA_LEN 16
+static uint8_t position_state[8 * POSITION_STATE_DATA_LEN];
 
-enum peripheral_slot_state {
-    PERIPHERAL_SLOT_STATE_OPEN,
-    PERIPHERAL_SLOT_STATE_CONNECTING,
-    PERIPHERAL_SLOT_STATE_CONNECTED,
-};
+// Define array for holding peripheral connections.
+static struct bt_conn *peripheral_conns[CONFIG_ZMK_SPLIT_BLE_CENTRAL_PERIPHERALS];
 
-struct peripheral_slot {
-    enum peripheral_slot_state state;
-    struct bt_conn *conn;
-    struct bt_gatt_discover_params discover_params;
-    struct bt_gatt_subscribe_params subscribe_params;
-    struct bt_gatt_discover_params sub_discover_params;
-    uint16_t run_behavior_handle;
-    uint8_t position_state[POSITION_STATE_DATA_LEN];
-    uint8_t changed_positions[POSITION_STATE_DATA_LEN];
-};
+static struct bt_uuid *service_uuid = BT_UUID_DECLARE_128(ZMK_SPLIT_BT_SERVICE_UUID);
+static struct bt_uuid *characteristic_uuid =
+    BT_UUID_DECLARE_128(ZMK_SPLIT_BT_CHAR_POSITION_STATE_UUID);
 
-static struct peripheral_slot peripherals[ZMK_BLE_SPLIT_PERIPHERAL_COUNT];
-
+// Track whether central is currently scanning for peripherals.
 static bool is_scanning = false;
 
-static const struct bt_uuid_128 split_service_uuid = BT_UUID_INIT_128(ZMK_SPLIT_BT_SERVICE_UUID);
+static struct bt_gatt_discover_params discover_params[CONFIG_ZMK_SPLIT_BLE_CENTRAL_PERIPHERALS];
+static struct bt_gatt_subscribe_params subscribe_params[CONFIG_ZMK_SPLIT_BLE_CENTRAL_PERIPHERALS];
+static struct bt_gatt_discover_params ccc_params[CONFIG_ZMK_SPLIT_BLE_CENTRAL_PERIPHERALS];
 
 K_MSGQ_DEFINE(peripheral_event_msgq, sizeof(struct zmk_position_state_changed),
               CONFIG_ZMK_SPLIT_BLE_CENTRAL_POSITION_QUEUE_SIZE, 4);
@@ -66,115 +61,41 @@ void peripheral_event_work_callback(struct k_work *work) {
 
 K_WORK_DEFINE(peripheral_event_work, peripheral_event_work_callback);
 
-int peripheral_slot_index_for_conn(struct bt_conn *conn) {
-    for (int i = 0; i < ZMK_BLE_SPLIT_PERIPHERAL_COUNT; i++) {
-        if (peripherals[i].conn == conn) {
+static void split_set_position(int peripheral_id, int position, bool is_pressed) {
+    bool was_pressed = position_state[position] != 255;
+
+    // Determine new state for position. Ignore released key if it was pressed
+    // on a different peripheral.
+    if (is_pressed) {
+        position_state[position] = peripheral_id;
+    } else if (position_state[position] == peripheral_id) {
+        position_state[position] = 255;
+    } else {
+        return;
+    }
+
+    // Handle event if state changed.
+    bool changed = was_pressed != is_pressed;
+    if (changed) {
+        struct zmk_position_state_changed ev = {
+            .position = position, .state = is_pressed, .timestamp = k_uptime_get()};
+        k_msgq_put(&peripheral_event_msgq, &ev, K_NO_WAIT);
+        k_work_submit(&peripheral_event_work);
+    }
+}
+
+static int split_central_get_peripheral_id(struct bt_conn *conn) {
+    for (int i = 0; i < CONFIG_ZMK_SPLIT_BLE_CENTRAL_PERIPHERALS; i++) {
+        if (peripheral_conns[i] == conn) {
             return i;
         }
     }
-
-    return -EINVAL;
-}
-
-struct peripheral_slot *peripheral_slot_for_conn(struct bt_conn *conn) {
-    int idx = peripheral_slot_index_for_conn(conn);
-    if (idx < 0) {
-        return NULL;
-    }
-
-    return &peripherals[idx];
-}
-
-int release_peripheral_slot(int index) {
-    if (index < 0 || index >= ZMK_BLE_SPLIT_PERIPHERAL_COUNT) {
-        return -EINVAL;
-    }
-
-    struct peripheral_slot *slot = &peripherals[index];
-
-    if (slot->state == PERIPHERAL_SLOT_STATE_OPEN) {
-        return -EINVAL;
-    }
-
-    LOG_DBG("Releasing peripheral slot at %d", index);
-
-    if (slot->conn != NULL) {
-        bt_conn_unref(slot->conn);
-        slot->conn = NULL;
-    }
-    slot->state = PERIPHERAL_SLOT_STATE_OPEN;
-
-    // Raise events releasing any active positions from this peripheral
-    for (int i = 0; i < POSITION_STATE_DATA_LEN; i++) {
-        for (int j = 0; j < 8; j++) {
-            if (slot->position_state[i] & BIT(j)) {
-                uint32_t position = (i * 8) + j;
-                struct zmk_position_state_changed ev = {.source = index,
-                                                        .position = position,
-                                                        .state = false,
-                                                        .timestamp = k_uptime_get()};
-
-                k_msgq_put(&peripheral_event_msgq, &ev, K_NO_WAIT);
-                k_work_submit(&peripheral_event_work);
-            }
-        }
-    }
-
-    for (int i = 0; i < POSITION_STATE_DATA_LEN; i++) {
-        slot->position_state[i] = 0U;
-        slot->changed_positions[i] = 0U;
-    }
-
-    // Clean up previously discovered handles;
-    slot->subscribe_params.value_handle = 0;
-    slot->run_behavior_handle = 0;
-
-    return 0;
-}
-
-int reserve_peripheral_slot(const bt_addr_le_t *addr) {
-    int i = zmk_ble_put_peripheral_addr(addr);
-    if (i >= 0) {
-        if (peripherals[i].state == PERIPHERAL_SLOT_STATE_OPEN) {
-            // Be sure the slot is fully reinitialized.
-            release_peripheral_slot(i);
-            peripherals[i].state = PERIPHERAL_SLOT_STATE_CONNECTING;
-            return i;
-        }
-    }
-
-    return -ENOMEM;
-}
-
-int release_peripheral_slot_for_conn(struct bt_conn *conn) {
-    int idx = peripheral_slot_index_for_conn(conn);
-    if (idx < 0) {
-        return idx;
-    }
-
-    return release_peripheral_slot(idx);
-}
-
-int confirm_peripheral_slot_conn(struct bt_conn *conn) {
-    int idx = peripheral_slot_index_for_conn(conn);
-    if (idx < 0) {
-        return idx;
-    }
-
-    peripherals[idx].state = PERIPHERAL_SLOT_STATE_CONNECTED;
-    return 0;
+    return -1;
 }
 
 static uint8_t split_central_notify_func(struct bt_conn *conn,
                                          struct bt_gatt_subscribe_params *params, const void *data,
                                          uint16_t length) {
-    struct peripheral_slot *slot = peripheral_slot_for_conn(conn);
-
-    if (slot == NULL) {
-        LOG_ERR("No peripheral state found for connection");
-        return BT_GATT_ITER_CONTINUE;
-    }
-
     if (!data) {
         LOG_DBG("[UNSUBSCRIBED]");
         params->value_handle = 0U;
@@ -183,223 +104,144 @@ static uint8_t split_central_notify_func(struct bt_conn *conn,
 
     LOG_DBG("[NOTIFICATION] data %p length %u", data, length);
 
-    for (int i = 0; i < POSITION_STATE_DATA_LEN; i++) {
-        slot->changed_positions[i] = ((uint8_t *)data)[i] ^ slot->position_state[i];
-        slot->position_state[i] = ((uint8_t *)data)[i];
-        LOG_DBG("data: %d", slot->position_state[i]);
+    int peripheral_id = split_central_get_peripheral_id(conn);
+    if (peripheral_id == -1) {
+        LOG_ERR("unable to identify peripheral connection");
+        return BT_GATT_ITER_STOP;
     }
-
     for (int i = 0; i < POSITION_STATE_DATA_LEN; i++) {
         for (int j = 0; j < 8; j++) {
-            if (slot->changed_positions[i] & BIT(j)) {
-                uint32_t position = (i * 8) + j;
-                bool pressed = slot->position_state[i] & BIT(j);
-                struct zmk_position_state_changed ev = {.source =
-                                                            peripheral_slot_index_for_conn(conn),
-                                                        .position = position,
-                                                        .state = pressed,
-                                                        .timestamp = k_uptime_get()};
-
-                k_msgq_put(&peripheral_event_msgq, &ev, K_NO_WAIT);
-                k_work_submit(&peripheral_event_work);
-            }
+            int position = (i * 8) + j;
+            bool is_pressed = ((uint8_t *)data)[i] & BIT(j);
+            split_set_position(peripheral_id, position, is_pressed);
         }
     }
 
     return BT_GATT_ITER_CONTINUE;
 }
 
-static void split_central_subscribe(struct bt_conn *conn) {
-    struct peripheral_slot *slot = peripheral_slot_for_conn(conn);
-    if (slot == NULL) {
-        LOG_ERR("No peripheral state found for connection");
-        return;
-    }
+static uint8_t split_central_discovery_func(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+                                            struct bt_gatt_discover_params *params) {
+	char addr_str[BT_ADDR_LE_STR_LEN];
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr_str, sizeof(addr_str));
 
-    int err = bt_gatt_subscribe(conn, &slot->subscribe_params);
-    switch (err) {
-    case -EALREADY:
-        LOG_DBG("[ALREADY SUBSCRIBED]");
-        break;
-    case 0:
-        LOG_DBG("[SUBSCRIBED]");
-        break;
-    default:
-        LOG_ERR("Subscribe failed (err %d)", err);
-        break;
-    }
-}
+	if (!attr) {
+		LOG_INF("completed Bluetooth service discovery on %s", log_strdup(addr_str));
+		return BT_GATT_ITER_STOP;
+	}
+    LOG_DBG("handle %u on %s", attr->handle, log_strdup(addr_str));
 
-static uint8_t split_central_chrc_discovery_func(struct bt_conn *conn,
-                                                 const struct bt_gatt_attr *attr,
-                                                 struct bt_gatt_discover_params *params) {
-    if (!attr) {
-        LOG_DBG("Discover complete");
+    int peripheral_id = split_central_get_peripheral_id(conn);
+    if (peripheral_id == -1) {
+        LOG_ERR("unable to identify peripheral connection");
         return BT_GATT_ITER_STOP;
     }
 
-    if (!attr->user_data) {
-        LOG_ERR("Required user data not passed to discovery");
-        return BT_GATT_ITER_STOP;
-    }
+	if (!bt_uuid_cmp(params->uuid, characteristic_uuid)) {
+		uint16_t value_handle = bt_gatt_attr_value_handle(attr);
+		struct bt_gatt_subscribe_params *sub_params = &subscribe_params[peripheral_id];
 
-    struct peripheral_slot *slot = peripheral_slot_for_conn(conn);
-    if (slot == NULL) {
-        LOG_ERR("No peripheral state found for connection");
-        return BT_GATT_ITER_STOP;
-    }
+		// Define notification subscription parameters.
+		sub_params->disc_params = &ccc_params[peripheral_id];
+		sub_params->end_handle = params->end_handle;
+		sub_params->value_handle = value_handle;
+		sub_params->notify = split_central_notify_func;
+		sub_params->value = BT_GATT_CCC_NOTIFY;
 
-    LOG_DBG("[ATTRIBUTE] handle %u", attr->handle);
+		// Subscribe to notifications.
+		int err = bt_gatt_subscribe(conn, sub_params);
+		if (err == -EALREADY) {
+			LOG_INF("notification subscription already exists for %s", log_strdup(addr_str));
+		} else if (err) {
+			LOG_ERR("failed to subscribe to notifications for %s (err %d)", log_strdup(addr_str), err);
+		} else {
+			LOG_INF("subscribed to notifications on %s", log_strdup(addr_str));
+		}
 
-    if (!bt_uuid_cmp(((struct bt_gatt_chrc *)attr->user_data)->uuid,
-                     BT_UUID_DECLARE_128(ZMK_SPLIT_BT_CHAR_POSITION_STATE_UUID))) {
-        LOG_DBG("Found position state characteristic");
-        slot->discover_params.uuid = NULL;
-        slot->discover_params.start_handle = attr->handle + 2;
-        slot->discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
+		return BT_GATT_ITER_CONTINUE;
+	}
 
-        slot->subscribe_params.disc_params = &slot->sub_discover_params;
-        slot->subscribe_params.end_handle = slot->discover_params.end_handle;
-        slot->subscribe_params.value_handle = bt_gatt_attr_value_handle(attr);
-        slot->subscribe_params.notify = split_central_notify_func;
-        slot->subscribe_params.value = BT_GATT_CCC_NOTIFY;
-        split_central_subscribe(conn);
-    } else if (!bt_uuid_cmp(((struct bt_gatt_chrc *)attr->user_data)->uuid,
-                            BT_UUID_DECLARE_128(ZMK_SPLIT_BT_CHAR_RUN_BEHAVIOR_UUID))) {
-        LOG_DBG("Found run behavior handle");
-        slot->run_behavior_handle = bt_gatt_attr_value_handle(attr);
-    }
-
-    bool subscribed = (slot->run_behavior_handle && slot->subscribe_params.value_handle);
-
-    return subscribed ? BT_GATT_ITER_STOP : BT_GATT_ITER_CONTINUE;
-}
-
-static uint8_t split_central_service_discovery_func(struct bt_conn *conn,
-                                                    const struct bt_gatt_attr *attr,
-                                                    struct bt_gatt_discover_params *params) {
-    if (!attr) {
-        LOG_DBG("Discover complete");
-        (void)memset(params, 0, sizeof(*params));
-        return BT_GATT_ITER_STOP;
-    }
-
-    LOG_DBG("[ATTRIBUTE] handle %u", attr->handle);
-
-    struct peripheral_slot *slot = peripheral_slot_for_conn(conn);
-    if (slot == NULL) {
-        LOG_ERR("No peripheral state found for connection");
-        return BT_GATT_ITER_STOP;
-    }
-
-    if (bt_uuid_cmp(slot->discover_params.uuid, BT_UUID_DECLARE_128(ZMK_SPLIT_BT_SERVICE_UUID))) {
-        LOG_DBG("Found other service");
-        return BT_GATT_ITER_CONTINUE;
-    }
-
-    LOG_DBG("Found split service");
-    slot->discover_params.uuid = NULL;
-    slot->discover_params.func = split_central_chrc_discovery_func;
-    slot->discover_params.start_handle = attr->handle + 1;
-    slot->discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
-
-    int err = bt_gatt_discover(conn, &slot->discover_params);
-    if (err) {
-        LOG_ERR("Failed to start discovering split service characteristics (err %d)", err);
-    }
     return BT_GATT_ITER_STOP;
 }
 
-static void split_central_process_connection(struct bt_conn *conn) {
-    int err;
-
+static void split_central_process_connection(struct bt_conn *conn, int peripheral_id) {
     LOG_DBG("Current security for connection: %d", bt_conn_get_security(conn));
 
-    err = bt_conn_set_security(conn, BT_SECURITY_L2);
+	// Set security for connection.
+    int err = bt_conn_set_security(conn, BT_SECURITY_L2);
     if (err) {
         LOG_ERR("Failed to set security (reason %d)", err);
         return;
     }
 
-    struct peripheral_slot *slot = peripheral_slot_for_conn(conn);
-    if (slot == NULL) {
-        LOG_ERR("No peripheral state found for connection");
+	// Define service discovery parameters.
+    LOG_DBG("Starting discovery for peripheral #%d", peripheral_id);
+	struct bt_gatt_discover_params *disc_params = &discover_params[peripheral_id];
+    disc_params->uuid = characteristic_uuid;
+    disc_params->start_handle = 0x0001;
+    disc_params->end_handle = 0xffff;
+    disc_params->func = split_central_discovery_func;
+    disc_params->type = BT_GATT_DISCOVER_CHARACTERISTIC;
+	err = bt_gatt_discover(conn, disc_params);
+    if (err) {
+        LOG_ERR("Discover failed(err %d)", err);
         return;
     }
 
-    if (!slot->subscribe_params.value_handle) {
-        slot->discover_params.uuid = &split_service_uuid.uuid;
-        slot->discover_params.func = split_central_service_discovery_func;
-        slot->discover_params.start_handle = 0x0001;
-        slot->discover_params.end_handle = 0xffff;
-        slot->discover_params.type = BT_GATT_DISCOVER_PRIMARY;
-
-        err = bt_gatt_discover(slot->conn, &slot->discover_params);
-        if (err) {
-            LOG_ERR("Discover failed(err %d)", err);
-            return;
-        }
-    }
-
     struct bt_conn_info info;
-
     bt_conn_get_info(conn, &info);
-
     LOG_DBG("New connection params: Interval: %d, Latency: %d, PHY: %d", info.le.interval,
             info.le.latency, info.le.phy->rx_phy);
-
-    // Restart scanning if necessary.
-    start_scan();
 }
 
+
 static bool split_central_eir_found(const bt_addr_le_t *addr) {
-    LOG_DBG("Found the split service");
+	LOG_DBG("Found the split service");
 
-    int slot_idx = reserve_peripheral_slot(addr);
-    if (slot_idx < 0) {
-        LOG_ERR("Failed to reserve peripheral slot (err %d)", slot_idx);
-        return false;
-    }
+	// Store peripheral address. If this operation fails, the peripheral
+	// must not match any of the known peripherals. Return false to stop
+	// parsing advertising data for peripheral.
+	int peripheral_i = zmk_ble_put_peripheral_addr(addr);
+	if (peripheral_i == -1) {
+		return false;
+	}
 
-    // Stop scanning so we can connect to the peripheral device.
-    LOG_DBG("Stopping peripheral scanning");
-    is_scanning = false;
-    int err = bt_le_scan_stop();
-    if (err) {
-        LOG_ERR("Stop LE scan failed (err %d)", err);
-        return false;
-    }
+	// Stop scanning so we can connect to the peripheral device.
+	LOG_INF("Stopping peripheral scanning");
+	is_scanning = false;
+	int err = bt_le_scan_stop();
+	if (err) {
+		LOG_ERR("Stop LE scan failed (err %d)", err);
+		return true;
+	}
 
-    struct peripheral_slot *slot = &peripherals[slot_idx];
+	// Create connection to peripheral with the given connection
+	// parameters.
+	struct bt_le_conn_param *param = BT_LE_CONN_PARAM(6, 6, 399, 900);
+	err = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN, param,
+			&peripheral_conns[peripheral_i]);
+	if (err) {
+		LOG_ERR("Create conn failed (err %d) (create conn? 0x%04x)", err,
+				BT_HCI_OP_LE_CREATE_CONN);
+		start_scan();
+		return false;
+	}
 
-    slot->conn = bt_conn_lookup_addr_le(BT_ID_DEFAULT, addr);
-    if (slot->conn) {
-        LOG_DBG("Found existing connection");
-        split_central_process_connection(slot->conn);
-        err = bt_conn_le_phy_update(slot->conn, BT_CONN_LE_PHY_PARAM_2M);
-        if (err) {
-            LOG_ERR("Update phy conn failed (err %d)", err);
-        }
-    } else {
-        struct bt_le_conn_param *param = BT_LE_CONN_PARAM(0x0006, 0x0006, 30, 400);
+	// TODO TODO TODO doesn't seem to do anything from here. try once zmk is on
+	// zephyr 2.7? define callback and double check?
+	err = bt_conn_le_phy_update(peripheral_conns[peripheral_i], BT_CONN_LE_PHY_PARAM_2M);
+	if (err) {
+		LOG_ERR("Update phy conn failed (err %d)", err);
+		start_scan();
+		return false;
+	}
 
-        LOG_DBG("Initiating new connnection");
-
-        err = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN, param, &slot->conn);
-        if (err) {
-            LOG_ERR("Create conn failed (err %d) (create conn? 0x%04x)", err,
-                    BT_HCI_OP_LE_CREATE_CONN);
-            start_scan();
-        }
-    }
-
-    return false;
+	// Stop processing advertisement data.
+	return false;
 }
 
 static bool split_central_eir_parse(struct bt_data *data, void *user_data) {
     bt_addr_le_t *addr = user_data;
-    int i;
-
     LOG_DBG("[AD]: %u data_len %u", data->type, data->data_len);
 
     switch (data->type) {
@@ -410,27 +252,25 @@ static bool split_central_eir_parse(struct bt_data *data, void *user_data) {
             return true;
         }
 
-        for (i = 0; i < data->data_len; i += 16) {
+        for (int i = 0; i < data->data_len; i += 16) {
             struct bt_uuid_128 uuid;
-
             if (!bt_uuid_create(&uuid.uuid, &data->data[i], 16)) {
                 LOG_ERR("Unable to load UUID");
                 continue;
             }
 
-            if (bt_uuid_cmp(&uuid.uuid, BT_UUID_DECLARE_128(ZMK_SPLIT_BT_SERVICE_UUID))) {
+            if (bt_uuid_cmp(&uuid.uuid, service_uuid)) {
                 char uuid_str[BT_UUID_STR_LEN];
                 char service_uuid_str[BT_UUID_STR_LEN];
 
                 bt_uuid_to_str(&uuid.uuid, uuid_str, sizeof(uuid_str));
-                bt_uuid_to_str(BT_UUID_DECLARE_128(ZMK_SPLIT_BT_SERVICE_UUID), service_uuid_str,
-                               sizeof(service_uuid_str));
+                bt_uuid_to_str(service_uuid, service_uuid_str, sizeof(service_uuid_str));
                 LOG_DBG("UUID %s does not match split UUID: %s", log_strdup(uuid_str),
                         log_strdup(service_uuid_str));
                 continue;
             }
 
-            return split_central_eir_found(addr);
+			return split_central_eir_found(addr);
         }
     }
 
@@ -458,7 +298,7 @@ static void split_central_device_found(const bt_addr_le_t *addr, int8_t rssi, ui
             rssi);
 
 	// Check if address matches hardcoded peripheral MAC address. This is only
-	// used while developing. TODO TODO TODO this section shouldn't be in the PR
+	// used while developing.
 	if (is_static_peripheral(addr)) {
 		// If no existing connection to peripheral, connect to it. This check is
 		// necessary since my development peripheral will advertise
@@ -473,29 +313,29 @@ static void split_central_device_found(const bt_addr_le_t *addr, int8_t rssi, ui
 		return;
 	}
 
-    /* We're only interested in connectable events */
-    if (type == BT_GAP_ADV_TYPE_ADV_IND || type == BT_GAP_ADV_TYPE_ADV_DIRECT_IND) {
-        bt_data_parse(ad, split_central_eir_parse, (void *)addr);
-    }
+	// We're only interested in connectable events.
+	if (type == BT_GAP_ADV_TYPE_ADV_IND || type == BT_GAP_ADV_TYPE_ADV_DIRECT_IND) {
+		bt_data_parse(ad, split_central_eir_parse, (void *) addr);
+	}
 }
 
 static int start_scan(void) {
     // No action is necessary if central is already scanning.
     if (is_scanning) {
-        LOG_DBG("Scanning already running");
+        LOG_INF("scanning is already on");
         return 0;
     }
 
     // If all the devices are connected, there is no need to scan.
     bool has_unconnected = false;
     for (int i = 0; i < CONFIG_ZMK_SPLIT_BLE_CENTRAL_PERIPHERALS; i++) {
-        if (peripherals[i].conn == NULL) {
+        if (peripheral_conns[i] == NULL) {
             has_unconnected = true;
             break;
         }
     }
     if (!has_unconnected) {
-        LOG_DBG("All devices are connected, scanning is unnecessary");
+        LOG_INF("all devices are connected");
         return 0;
     }
 
@@ -507,53 +347,76 @@ static int start_scan(void) {
         return err;
     }
 
-    LOG_DBG("Scanning successfully started");
+    LOG_INF("Scanning successfully started");
     return 0;
 }
 
 static void split_central_connected(struct bt_conn *conn, uint8_t conn_err) {
-    char addr[BT_ADDR_LE_STR_LEN];
-    struct bt_conn_info info;
+    // Only handle connection if it corresponds to a peripheral.
+    for (int i = 0; i < CONFIG_ZMK_SPLIT_BLE_CENTRAL_PERIPHERALS; i++) {
+        if (conn == peripheral_conns[i]) {
+			// Restart scanning if necessary.
+            start_scan();
 
-    bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+			char addr[BT_ADDR_LE_STR_LEN];
+            bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
-    bt_conn_get_info(conn, &info);
-
-    if (info.role != BT_CONN_ROLE_CENTRAL) {
-        LOG_DBG("SKIPPING FOR ROLE %d", info.role);
-        return;
+            if (conn_err) {
+                LOG_ERR("Failed to connect to %s (%u)", log_strdup(addr), conn_err);
+                bt_conn_unref(peripheral_conns[i]);
+                peripheral_conns[i] = NULL;
+            } else {
+                LOG_INF("Connected: %s", log_strdup(addr));
+                split_central_process_connection(conn, i);
+            }
+        }
     }
-
-    if (conn_err) {
-        LOG_ERR("Failed to connect to %s (%u)", log_strdup(addr), conn_err);
-
-        release_peripheral_slot_for_conn(conn);
-
-        start_scan();
-        return;
-    }
-
-    LOG_DBG("Connected: %s", log_strdup(addr));
-
-    confirm_peripheral_slot_conn(conn);
-    split_central_process_connection(conn);
 }
 
+void start_scan_work_handler(struct k_work *work) {
+	start_scan();
+}
+
+K_WORK_DEFINE(start_scan_work, start_scan_work_handler);
+
+void start_scan_timer_handler(struct k_timer *dummy) {
+	k_work_submit(&start_scan_work);
+}
+
+K_TIMER_DEFINE(start_scan_timer, start_scan_timer_handler, NULL);
+
 static void split_central_disconnected(struct bt_conn *conn, uint8_t reason) {
-    char addr[BT_ADDR_LE_STR_LEN];
-    int err;
+    char addr_str[BT_ADDR_LE_STR_LEN];
+	const bt_addr_le_t *addr = bt_conn_get_dst(conn);
+    bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
+    LOG_INF("Disconnected: %s (reason %d)", log_strdup(addr_str), reason);
 
-    bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+    // Only handle connection if it corresponds to a peripheral.
+    for (int i = 0; i < CONFIG_ZMK_SPLIT_BLE_CENTRAL_PERIPHERALS; i++) {
+        if (conn == peripheral_conns[i]) {
+            // Unset peripheral connection.
+            bt_conn_unref(peripheral_conns[i]);
+            peripheral_conns[i] = NULL;
 
-    LOG_DBG("Disconnected: %s (reason %d)", log_strdup(addr), reason);
+            // Release all keys that were held by the peripheral.
+            for (int position = 0; position < 8 * POSITION_STATE_DATA_LEN; position++) {
+                split_set_position(i, position, false);
+            }
 
-    err = release_peripheral_slot_for_conn(conn);
-
-    if (err < 0) {
-        return;
+            // Start scanning again if necessary. TODO TODO TODO for my personal
+			// peripheral, wait a few seconds before restarting scanning. It
+			// advertises continuously and this increases the probability that
+			// the disconnect is acknowledged there before the reconnect.
+			// Otherwise repeatedly connecting and disconnecting occasionally
+			// results in an assert, likely due to a Zephyr bug. Reevaluate this
+			// edge case after upgrading ZMK to Zephyr 2.7.
+			if (is_static_peripheral(addr)) {
+				k_timer_start(&start_scan_timer, K_SECONDS(5), K_NO_WAIT);
+			} else {
+				start_scan();
+			}
+        }
     }
-
-    start_scan();
 }
 
 static struct bt_conn_cb conn_callbacks = {
@@ -561,94 +424,18 @@ static struct bt_conn_cb conn_callbacks = {
     .disconnected = split_central_disconnected,
 };
 
-K_THREAD_STACK_DEFINE(split_central_split_run_q_stack,
-                      CONFIG_ZMK_BLE_SPLIT_CENTRAL_SPLIT_RUN_STACK_SIZE);
-
-struct k_work_q split_central_split_run_q;
-
-struct zmk_split_run_behavior_payload_wrapper {
-    uint8_t source;
-    struct zmk_split_run_behavior_payload payload;
-};
-
-K_MSGQ_DEFINE(zmk_split_central_split_run_msgq,
-              sizeof(struct zmk_split_run_behavior_payload_wrapper),
-              CONFIG_ZMK_BLE_SPLIT_CENTRAL_SPLIT_RUN_QUEUE_SIZE, 4);
-
-void split_central_split_run_callback(struct k_work *work) {
-    struct zmk_split_run_behavior_payload_wrapper payload_wrapper;
-
-    LOG_DBG("");
-
-    while (k_msgq_get(&zmk_split_central_split_run_msgq, &payload_wrapper, K_NO_WAIT) == 0) {
-        if (peripherals[payload_wrapper.source].state != PERIPHERAL_SLOT_STATE_CONNECTED) {
-            LOG_ERR("Source not connected");
-            continue;
-        }
-
-        int err = bt_gatt_write_without_response(
-            peripherals[payload_wrapper.source].conn,
-            peripherals[payload_wrapper.source].run_behavior_handle, &payload_wrapper.payload,
-            sizeof(struct zmk_split_run_behavior_payload), true);
-
-        if (err) {
-            LOG_ERR("Failed to write the behavior characteristic (err %d)", err);
-        }
-    }
-}
-
-K_WORK_DEFINE(split_central_split_run_work, split_central_split_run_callback);
-
-static int
-split_bt_invoke_behavior_payload(struct zmk_split_run_behavior_payload_wrapper payload_wrapper) {
-    LOG_DBG("");
-
-    int err = k_msgq_put(&zmk_split_central_split_run_msgq, &payload_wrapper, K_MSEC(100));
-    if (err) {
-        switch (err) {
-        case -EAGAIN: {
-            LOG_WRN("Consumer message queue full, popping first message and queueing again");
-            struct zmk_split_run_behavior_payload_wrapper discarded_report;
-            k_msgq_get(&zmk_split_central_split_run_msgq, &discarded_report, K_NO_WAIT);
-            return split_bt_invoke_behavior_payload(payload_wrapper);
-        }
-        default:
-            LOG_WRN("Failed to queue behavior to send (%d)", err);
-            return err;
-        }
-    }
-
-    k_work_submit_to_queue(&split_central_split_run_q, &split_central_split_run_work);
-
-    return 0;
-};
-
-int zmk_split_bt_invoke_behavior(uint8_t source, struct zmk_behavior_binding *binding,
-                                 struct zmk_behavior_binding_event event, bool state) {
-    struct zmk_split_run_behavior_payload payload = {.data = {
-                                                         .param1 = binding->param1,
-                                                         .param2 = binding->param2,
-                                                         .position = event.position,
-                                                         .state = state ? 1 : 0,
-                                                     }};
-    const size_t payload_dev_size = sizeof(payload.behavior_dev);
-    if (strlcpy(payload.behavior_dev, binding->behavior_dev, payload_dev_size) >=
-        payload_dev_size) {
-        LOG_ERR("Truncated behavior label %s to %s before invoking peripheral behavior",
-                log_strdup(binding->behavior_dev), log_strdup(payload.behavior_dev));
-    }
-
-    struct zmk_split_run_behavior_payload_wrapper wrapper = {.source = source, .payload = payload};
-    return split_bt_invoke_behavior_payload(wrapper);
-}
-
 int zmk_split_bt_central_init(const struct device *_arg) {
-    k_work_queue_start(&split_central_split_run_q, split_central_split_run_q_stack,
-                       K_THREAD_STACK_SIZEOF(split_central_split_run_q_stack),
-                       CONFIG_ZMK_BLE_THREAD_PRIORITY, NULL);
-    bt_conn_cb_register(&conn_callbacks);
+    // Initialize array for state of peripheral keys. Set array to 255, which
+    // signifies that no key is active.
+    (void)memset(position_state, 255, 8 * POSITION_STATE_DATA_LEN);
 
+    bt_conn_cb_register(&conn_callbacks);
     return start_scan();
 }
 
 SYS_INIT(zmk_split_bt_central_init, APPLICATION, CONFIG_ZMK_BLE_INIT_PRIORITY);
+
+int zmk_split_bt_invoke_behavior(uint8_t source, struct zmk_behavior_binding *binding,
+                                 struct zmk_behavior_binding_event event, bool state) {
+	return 0;
+}
