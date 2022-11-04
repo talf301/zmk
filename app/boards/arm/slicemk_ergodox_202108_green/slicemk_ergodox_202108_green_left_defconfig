@@ -38,5 +38,5 @@ CONFIG_BT_CTLR_TX_PWR_PLUS_8=y
 # Include support for Coded PHY.
 CONFIG_BT_CTLR_PHY_CODED=y
 
-# Use RC oscillator as PCB does not include external 32.768kHz crystals.
-CONFIG_CLOCK_CONTROL_NRF_K32SRC_RC=y
+# Synthesize 32.768kHz from HFCLK crystal.
+CONFIG_CLOCK_CONTROL_NRF_K32SRC_SYNTH=y
