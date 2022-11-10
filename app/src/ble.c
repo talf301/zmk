@@ -362,7 +362,7 @@ static int ble_profiles_handle_set(const char *name, size_t len, settings_read_c
         }
 
         int i = atoi(next);
-        if (i >= ZMK_BLE_SPLIT_PERIPHERAL_COUNT) {
+        if (i < 0 || i >= ZMK_BLE_SPLIT_PERIPHERAL_COUNT) {
             LOG_ERR("Failed to store peripheral address in memory");
         } else {
             int err = read_cb(cb_arg, &peripheral_addrs[i], sizeof(bt_addr_le_t));

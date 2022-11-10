@@ -357,7 +357,7 @@ static int stop_scanning() {
     is_scanning = false;
 
     int err = bt_le_scan_stop();
-    if (err) {
+    if (err < 0) {
         LOG_ERR("Stop LE scan failed (err %d)", err);
         return err;
     }
@@ -370,7 +370,7 @@ static bool split_central_eir_found(const bt_addr_le_t *addr) {
 
     // Stop scanning so we can connect to the peripheral device.
     int err = stop_scanning();
-    if (err) {
+    if (err < 0) {
         return false;
     }
 
@@ -382,25 +382,13 @@ static bool split_central_eir_found(const bt_addr_le_t *addr) {
 
     struct peripheral_slot *slot = &peripherals[slot_idx];
 
-    slot->conn = bt_conn_lookup_addr_le(BT_ID_DEFAULT, addr);
-    if (slot->conn) {
-        LOG_DBG("Found existing connection");
-        split_central_process_connection(slot->conn);
-        err = bt_conn_le_phy_update(slot->conn, BT_CONN_LE_PHY_PARAM_2M);
-        if (err) {
-            LOG_ERR("Update phy conn failed (err %d)", err);
-        }
-    } else {
-        struct bt_le_conn_param *param = BT_LE_CONN_PARAM(0x0006, 0x0006, 30, 400);
-
-        LOG_DBG("Initiating new connnection");
-
-        err = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN, param, &slot->conn);
-        if (err) {
-            LOG_ERR("Create conn failed (err %d) (create conn? 0x%04x)", err,
-                    BT_HCI_OP_LE_CREATE_CONN);
-            start_scanning();
-        }
+    LOG_DBG("Initiating new connnection");
+    struct bt_le_conn_param *param = BT_LE_CONN_PARAM(0x0006, 0x0006, 30, 400);
+    err = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN, param, &slot->conn);
+    if (err < 0) {
+        LOG_ERR("Create conn failed (err %d) (create conn? 0x%04x)", err, BT_HCI_OP_LE_CREATE_CONN);
+        release_peripheral_slot(slot_idx);
+        start_scanning();
     }
 
     return false;
@@ -484,7 +472,7 @@ static int start_scanning(void) {
     // Start scanning otherwise.
     is_scanning = true;
     int err = bt_le_scan_start(BT_LE_SCAN_PASSIVE, split_central_device_found);
-    if (err) {
+    if (err < 0) {
         LOG_ERR("Scanning failed to start (err %d)", err);
         return err;
     }
