@@ -217,7 +217,7 @@ static bool split_central_eir_found(const bt_addr_le_t *addr) {
 
 	// Create connection to peripheral with the given connection
 	// parameters.
-	struct bt_le_conn_param *param = BT_LE_CONN_PARAM(6, 6, 399, 900);
+	struct bt_le_conn_param *param = BT_LE_CONN_PARAM(6, 6, 39, 90);
 	err = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN, param,
 			&peripheral_conns[peripheral_i]);
 	if (err) {
