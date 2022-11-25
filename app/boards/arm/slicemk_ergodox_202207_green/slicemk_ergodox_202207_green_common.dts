@@ -1,6 +1,8 @@
 /dts-v1/;
 #include <nordic/nrf52833_qiaa.dtsi>
 
+#include <dt-bindings/led/led.h>
+
 / {
 	model = "SliceMK ErgoDox 202207 Green";
 
@@ -11,12 +13,20 @@
 		zephyr,console = &cdc_acm_uart;
 
 		zmk,battery = &vbatt;
+		zmk,underglow = &led_strip;
 	};
 
 	// Use VDDHDIV5 for battery voltage.
 	vbatt: vbatt {
 		compatible = "zmk,battery-nrf-vddh";
 		label = "VBATT";
+	};
+
+	ext-power {
+		compatible = "zmk,ext-power-generic";
+		label = "EXT_POWER";
+		control-gpios = <&gpio0 14 GPIO_ACTIVE_HIGH>;
+		init-delay-ms = <50>;
 	};
 };
 
@@ -59,5 +69,31 @@
 			label = "storage";
 			reg = <0x0006d000 0x00007000>;
 		};
+	};
+};
+
+&spi0 {
+	compatible = "nordic,nrf-spim";
+	status = "okay";
+
+	// Define pin for LED data.
+	mosi-pin = <20>;
+
+	// Zephyr requires SCK and MISO to be defined but they are not used so pick
+	// two random unused pins.
+	sck-pin = <23>;
+	miso-pin = <34>;
+
+	led_strip: ws2812@0 {
+		compatible = "worldsemi,ws2812-spi";
+		label = "WS2812";
+
+		reg = <0>;
+		spi-max-frequency = <4000000>;
+
+		chain-length = <10>;
+		color-mapping = <LED_COLOR_ID_GREEN LED_COLOR_ID_RED LED_COLOR_ID_BLUE>;
+		spi-one-frame = <0x70>;
+		spi-zero-frame = <0x40>;
 	};
 };

@@ -2,6 +2,13 @@
 #include "slicemk_ergodox_202205_green_common.dts"
 
 / {
+	ext-power {
+		compatible = "zmk,ext-power-generic";
+		label = "EXT_POWER";
+		control-gpios = <&gpio0 1 GPIO_ACTIVE_HIGH>;
+		init-delay-ms = <50>;
+	};
+
 	ergodox_a: ergodox_a {
 		compatible = "ergodox-a";
 		#gpio-cells = <2>;
@@ -23,4 +30,14 @@
 			, <12 0 &gpio0 6 0>
 			;
 	};
+};
+
+&spi0 {
+	// Define pin for LED data.
+	mosi-pin = <23>;
+
+	// Zephyr requires SCK and MISO to be defined but they are not used so pick
+	// two random unused pins.
+	sck-pin = <4>;
+	miso-pin = <5>;
 };
